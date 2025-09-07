@@ -1,0 +1,14 @@
+# Flask Churn Prediction App Requirements
+# 
+# This file lists all Python packages required to run the Flask application.
+# Install with: pip install -r requirements.txt
+
+
+# Data science and machine learning libraries
+pandas==2.1.4                 # Data manipulation and analysis
+numpy==1.26.4                 # Numerical computing
+scikit-learn==1.7.0           # Machine learning algorithms
+joblib==1.3.2                 # Model serialization
+matplotlib==3.7.5             # Plotting library
+seaborn==0.13.2               # Statistical visualization
+mlflow==3.3.1

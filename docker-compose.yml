@@ -1,0 +1,295 @@
+# docker-compose.yml
+#
+# Multi-service Docker Compose configuration for MLOps pipeline
+# Integrated with MLflow tracking server and training workflow
+
+#version: '3.8'
+name: projet-synthese-ia
+services:
+  # ==============================================
+  # DATABASE SERVICE (for MLflow backend)
+  # ==============================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: churn_postgres
+    environment:
+      POSTGRES_DB: mlflow_db
+      POSTGRES_USER: mlflow_user
+      POSTGRES_PASSWORD: mlflow_password
+      POSTGRES_INITDB_ARGS: "--auth-local=trust --auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    command: >
+      postgres
+      -c log_statement=all
+      -c log_destination=stderr
+      -c logging_collector=off
+
+  # ==============================================
+  # MLFLOW TRACKING SERVER (matching train.py port 8080)
+  # ==============================================
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mlflow
+    container_name: churn_mlflow
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://mlflow_user:mlflow_password@postgres:5432/mlflow_db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/app/mlflow-artifacts
+      - MLFLOW_SERVE_ARTIFACTS=true
+      - MLFLOW_HOST=0.0.0.0
+      - MLFLOW_PORT=5000   # Container internal port
+    ports:
+      - "8082:5000"  # Host:8082 → Container:5000
+    volumes:
+      - mlflow_artifacts:/app/mlflow-artifacts
+      - /var/lib/jenkins/projet-synthese-ia/model:/app/model
+      - /var/lib/jenkins/projet-synthese-ia/data:/app/data
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    command: >
+      mlflow server 
+      --backend-store-uri postgresql://mlflow_user:mlflow_password@postgres:5432/mlflow_db
+      --default-artifact-root /app/mlflow-artifacts
+      --host 0.0.0.0 
+      --port 5000
+      --serve-artifacts
+
+  # ==============================================
+  # TRAINING SERVICE (runs train.py)
+  # ==============================================
+#  training:
+#    build:
+#      context: .
+#      dockerfile: docker/Dockerfile.training
+#    container_name: churn_training
+#    environment:
+#      - MLFLOW_TRACKING_URI=http://mlflow:5000  # Container internal access
+#      - PYTHONPATH=/app
+#      - DOCKER_CONTAINERIZED=1
+#    volumes:
+#      - /var/lib/jenkins/projet-synthese-ia/data:/app/data
+#      - /var/lib/jenkins/projet-synthese-ia/model:/app/model
+#      - /var/lib/jenkins/projet-synthese-ia/scripts:/app/scripts
+#    depends_on:
+#      - mlflow
+#    command: python train.py
+
+  # ==============================================
+  # FASTAPI SERVICE (prediction API)
+  # ==============================================
+  fastapi:
+    build:
+      context: ./src/fastapi-app
+      dockerfile: ../../docker/Dockerfile.fastapi-app
+    container_name: churn_fastapi
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000  # Container internal access
+      - MODEL_PATH=/app/model/best_churn_model.joblib
+      - LOG_LEVEL=info
+      - PYTHONPATH=/app
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/lib/jenkins/projet-synthese-ia/model:/app/model
+      - /var/lib/jenkins/projet-synthese-ia/data:/app/data
+      - /var/lib/jenkins/projet-synthese-ia/reports:/app/reports
+    depends_on:
+      - mlflow
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+
+  # ==============================================
+  # FLASK WEB APPLICATION
+  # ==============================================
+  flask:
+    build:
+      context: ./src/flask-app
+      dockerfile: ../../docker/Dockerfile.flask-app
+    container_name: churn_flask
+    environment:
+      - FASTAPI_URL=http://fastapi:8000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000  # Container internal access
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+    ports:
+      - "5001:5000"
+    volumes:
+      - /var/lib/jenkins/projet-synthese-ia/model:/app/model
+    depends_on:
+      - fastapi
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ==============================================
+  # STREAMLIT DASHBOARD
+  # ==============================================
+  streamlit:
+    build:
+      context: ./src/streamlit-app
+      dockerfile: ../../docker/Dockerfile.streamlit-app
+    container_name: churn_streamlit
+    environment:
+      - FASTAPI_URL=http://fastapi:8000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000  # Container internal access
+      - PYTHONPATH=/app
+    ports:
+      - "8501:8501"
+    volumes:
+      - /var/lib/jenkins/projet-synthese-ia/model:/app/model
+      - /var/lib/jenkins/projet-synthese-ia/data:/app/data
+      - /var/lib/jenkins/projet-synthese-ia/reports:/app/reports
+    depends_on:
+      - fastapi
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ==============================================
+  # MONITORING SERVICE
+  # ==============================================
+  monitoring:
+    build:
+      context: ./src/monitoring
+      dockerfile: ../../docker/Dockerfile.monitoring
+    container_name: churn_monitoring
+    environment:
+      - FASTAPI_URL=http://fastapi:8000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000  # Container internal access
+      - MONITORING_INTERVAL=300  # 5 minutes
+      - PYTHONPATH=/app
+    volumes:
+      - /var/lib/jenkins/projet-synthese-ia/data:/app/data
+      - /var/lib/jenkins/projet-synthese-ia/reports:/app/reports
+      - /var/lib/jenkins/projet-synthese-ia/model:/app/model
+    depends_on:
+      - fastapi
+      - mlflow
+    restart: unless-stopped
+    command: python monitoring_service.py
+
+# ==============================================
+  # PROMETHEUS MONITORING
+  # ==============================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: churn_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - /var/lib/jenkins/projet-synthese-ia/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+
+  # ==============================================
+  # GRAFANA DASHBOARD
+  # ==============================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: churn_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=bded1234
+      - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    ports:
+      - 8090:8080
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - 9100:9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points="^/(sys|proc|dev|host|etc)($$|/)"'
+
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:latest
+    command:
+      - '-nginx.scrape-uri=http://nginx/stub_status'
+    ports:
+      - 9113:9113
+  # ==============================================
+  # REVERSE PROXY (NGINX)
+  # ==============================================
+  nginx:
+    image: nginx:alpine
+    container_name: churn_nginx
+    ports:
+      - "80:80"
+    volumes:
+      - /var/lib/jenkins/projet-synthese-ia/nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - flask
+      - fastapi
+      - streamlit
+      - mlflow
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+# ==============================================
+#VOLUMES
+# ==============================================
+
+
+volumes:
+  postgres_data:
+    driver: local
+  mlflow_artifacts:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
